@@ -1,0 +1,164 @@
+---
+- name: Rust-Entwicklungsumgebung auf Ubuntu 24.04 bereitstellen
+  hosts: rust_dev
+  gather_facts: true
+
+  vars:
+    rustup_home: "{{ ansible_env.HOME }}/.rustup"
+    cargo_home: "{{ ansible_env.HOME }}/.cargo"
+    cargo_bin: "{{ ansible_env.HOME }}/.cargo/bin"
+
+  tasks:
+    # ── 1. OS prüfen ──────────────────────────────────────────────
+    - name: Sicherstellen, dass Ubuntu 24.04 verwendet wird
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version == "24.04"
+        fail_msg: "Dieses Playbook erfordert Ubuntu 24.04 (erkannt: {{ ansible_distribution }} {{ ansible_distribution_version }})"
+
+    # ── 2. System-Pakete installieren ─────────────────────────────
+    - name: Benötigte System-Pakete installieren
+      become: true
+      ansible.builtin.apt:
+        name:
+          - curl
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - linux-tools-common
+          - "linux-tools-{{ ansible_kernel }}"
+        state: present
+        cache_valid_time: 3600
+
+    # ── 3. Rustup installieren ────────────────────────────────────
+    - name: Prüfen ob rustup bereits installiert ist
+      ansible.builtin.stat:
+        path: "{{ cargo_bin }}/rustup"
+      register: rustup_bin
+
+    - name: Rustup-Installer herunterladen
+      ansible.builtin.get_url:
+        url: https://sh.rustup.rs
+        dest: /tmp/rustup-init.sh
+        mode: "0755"
+      when: not rustup_bin.stat.exists
+
+    - name: Rustup installieren
+      ansible.builtin.command:
+        cmd: /tmp/rustup-init.sh -y --default-toolchain stable
+        creates: "{{ cargo_bin }}/rustup"
+      when: not rustup_bin.stat.exists
+
+    - name: Rustup-Installer aufräumen
+      ansible.builtin.file:
+        path: /tmp/rustup-init.sh
+        state: absent
+
+    # ── 4. Nightly Toolchain + rust-src ───────────────────────────
+    - name: Installierte Toolchains auflisten
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/rustup toolchain list"
+      register: toolchain_list
+      changed_when: false
+
+    - name: Nightly Toolchain mit rust-src installieren
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/rustup toolchain install nightly --component rust-src"
+      when: "'nightly' not in toolchain_list.stdout"
+      environment:
+        PATH: "{{ cargo_bin }}:{{ ansible_env.PATH }}"
+
+    # ── 5. bpf-linker installieren ────────────────────────────────
+    - name: Prüfen ob bpf-linker bereits installiert ist
+      ansible.builtin.stat:
+        path: "{{ cargo_bin }}/bpf-linker"
+      register: bpf_linker_bin
+
+    - name: bpf-linker installieren (kann 10-20 Min. dauern)
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/cargo install bpf-linker"
+      when: not bpf_linker_bin.stat.exists
+      environment:
+        PATH: "{{ cargo_bin }}:{{ ansible_env.PATH }}"
+      async: 1800
+      poll: 30
+
+    # ── 6. cargo-generate installieren ────────────────────────────
+    - name: Prüfen ob cargo-generate bereits installiert ist
+      ansible.builtin.stat:
+        path: "{{ cargo_bin }}/cargo-generate"
+      register: cargo_generate_bin
+
+    - name: cargo-generate installieren
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/cargo install cargo-generate"
+      when: not cargo_generate_bin.stat.exists
+      environment:
+        PATH: "{{ cargo_bin }}:{{ ansible_env.PATH }}"
+      async: 1200
+      poll: 30
+
+    # ── 7. Verifikation ──────────────────────────────────────────
+    - name: Rustup-Version ausgeben
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/rustup --version"
+      register: rustup_version
+      changed_when: false
+
+    - name: Cargo-Version ausgeben
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/cargo --version"
+      register: cargo_version
+      changed_when: false
+
+    - name: Installierte Toolchains ausgeben
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/rustup toolchain list"
+      register: final_toolchain_list
+      changed_when: false
+
+    - name: bpftool-Version ausgeben
+      become: true
+      ansible.builtin.command:
+        cmd: bpftool version
+      register: bpftool_version
+      changed_when: false
+
+    - name: Installationsergebnis anzeigen
+      ansible.builtin.debug:
+        msg:
+          - "rustup:         {{ rustup_version.stdout }}"
+          - "cargo:          {{ cargo_version.stdout }}"
+          - "toolchains:     {{ final_toolchain_list.stdout_lines }}"
+          - "bpftool:        {{ bpftool_version.stdout }}"
+
+    - name: Verifikation – stable als Default, nightly vorhanden, Tools erreichbar
+      ansible.builtin.assert:
+        that:
+          - "'stable' in final_toolchain_list.stdout"
+          - "'default' in final_toolchain_list.stdout"
+          - "'nightly' in final_toolchain_list.stdout"
+        fail_msg: "Toolchain-Verifikation fehlgeschlagen: {{ final_toolchain_list.stdout_lines }}"
+
+    - name: Verifikation – bpf-linker erreichbar
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/bpf-linker --version"
+      changed_when: false
+      failed_when: bpf_linker_check.rc != 0
+      register: bpf_linker_check
+
+    - name: Verifikation – cargo-generate erreichbar
+      ansible.builtin.command:
+        cmd: "{{ cargo_bin }}/cargo-generate --version"
+      changed_when: false
+      failed_when: cargo_generate_check.rc != 0
+      register: cargo_generate_check
+
+    - name: Verifikation – bpftool erreichbar
+      become: true
+      ansible.builtin.command:
+        cmd: bpftool version
+      changed_when: false
+      failed_when: bpftool_check.rc != 0
+      register: bpftool_check
